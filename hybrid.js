@@ -1,3 +1,6 @@
+import { processPlyBuffer, floatToHalf, packHalf2x16, readChunks } from './converter.js';
+import { vertexShaderSource, fragmentShaderSource } from './static.js'; // 追加: static.jsからシェーダー定数をインポート
+
 let cameras = [
   {
     id: 0,
@@ -17,6 +20,13 @@ let cameras = [
 
 let camera = cameras[0];
 
+// 再生制御のためのグローバル変数
+let isPlaying = true; // 再生状態（初期値は再生中）
+let isAnimationEnded = false; // アニメーション終了状態
+let animationStartTime = 0; // アニメーション開始時間
+let animationPauseTime = 0; // 一時停止した時間
+let animationTotalDuration = 10000; // アニメーションの総再生時間（ミリ秒）、必要に応じて調整してください
+
 function createWorker(self) {
   let vertexCount = 0;
   let viewProj;
@@ -24,39 +34,6 @@ function createWorker(self) {
   let depthIndex = new Uint32Array();
   let lastVertexCount = 0;
   let positions;
-
-  var _floatView = new Float32Array(1);
-  var _int32View = new Int32Array(_floatView.buffer);
-
-  function floatToHalf(float) {
-    _floatView[0] = float;
-    var f = _int32View[0];
-    var sign = (f >> 31) & 0x0001;
-    var exp = (f >> 23) & 0x00ff;
-    var frac = f & 0x007fffff;
-    var newExp;
-    if (exp == 0) {
-      newExp = 0;
-    } else if (exp < 113) {
-      newExp = 0;
-      frac |= 0x00800000;
-      frac = frac >> (113 - exp);
-      if (frac & 0x01000000) {
-        newExp = 1;
-        frac = 0;
-      }
-    } else if (exp < 142) {
-      newExp = exp - 112;
-    } else {
-      newExp = 31;
-      frac = 0;
-    }
-    return (sign << 15) | (newExp << 10) | (frac >> 13);
-  }
-
-  function packHalf2x16(x, y) {
-    return (floatToHalf(x) | (floatToHalf(y) << 16)) >>> 0;
-  }
 
   function runSort(viewProj) {
     if (!positions) return;
@@ -114,137 +91,6 @@ function createWorker(self) {
 
   let sortRunning;
 
-  function processPlyBuffer(inputBuffer) {
-    const ubuf = new Uint8Array(inputBuffer);
-    // 10KB ought to be enough for a header...
-    const header = new TextDecoder().decode(ubuf.slice(0, 1024 * 10));
-    const header_end = "end_header\n";
-    const header_end_index = header.indexOf(header_end);
-    if (header_end_index < 0) throw new Error("Unable to read .ply file header");
-    const vertexCount = parseInt(/element vertex (\d+)\n/.exec(header)[1]);
-    console.log("Vertex Count", vertexCount);
-    let row_offset = 0,
-      offsets = {},
-      types = {};
-    const TYPE_MAP = {
-      double: "getFloat64",
-      int: "getInt32",
-      uint: "getUint32",
-      float: "getFloat32",
-      short: "getInt16",
-      ushort: "getUint16",
-      uchar: "getUint8",
-    };
-    for (let prop of header
-      .slice(0, header_end_index)
-      .split("\n")
-      .filter((k) => k.startsWith("property "))) {
-      const [p, type, name] = prop.split(" ");
-      const arrayType = TYPE_MAP[type] || "getInt8";
-      types[name] = arrayType;
-      offsets[name] = row_offset;
-      row_offset += parseInt(arrayType.replace(/[^\d]/g, "")) / 8;
-    }
-
-    console.log("Bytes per row", row_offset, types, offsets);
-
-    let dataView = new DataView(inputBuffer, header_end_index + header_end.length);
-    let row = 0;
-    const attrs = new Proxy(
-      {},
-      {
-        get(target, prop) {
-          if (!types[prop]) throw new Error(prop + " not found");
-          return dataView[types[prop]](row * row_offset + offsets[prop], true);
-        },
-      }
-    );
-
-    console.time("calculate importance");
-    let sizeList = new Float32Array(vertexCount);
-    let sizeIndex = new Uint32Array(vertexCount);
-    for (row = 0; row < vertexCount; row++) {
-      sizeIndex[row] = row;
-      if (!types["scale_0"]) continue;
-      const size = Math.exp(attrs.scale_0) * Math.exp(attrs.scale_1) * Math.exp(attrs.scale_2);
-      const opacity = 1 / (1 + Math.exp(-attrs.opacity));
-      sizeList[row] = size * opacity;
-    }
-    console.timeEnd("calculate importance");
-
-    for (let type in types) {
-      let min = Infinity,
-        max = -Infinity;
-      for (row = 0; row < vertexCount; row++) {
-        sizeIndex[row] = row;
-        min = Math.min(min, attrs[type]);
-        max = Math.max(max, attrs[type]);
-      }
-      console.log(type, min, max);
-    }
-
-    console.time("sort");
-    sizeIndex.sort((b, a) => sizeList[a] - sizeList[b]);
-    console.timeEnd("sort");
-
-    const position_buffer = new Float32Array(3 * vertexCount);
-
-    var texwidth = 1024 * 4; // Set to your desired width
-    var texheight = Math.ceil((4 * vertexCount) / texwidth); // Set to your desired height
-    var texdata = new Uint32Array(texwidth * texheight * 4); // 4 components per pixel (RGBA)
-    var texdata_c = new Uint8Array(texdata.buffer);
-    var texdata_f = new Float32Array(texdata.buffer);
-
-    console.time("build buffer");
-    for (let j = 0; j < vertexCount; j++) {
-      row = sizeIndex[j];
-
-      // x, y, z
-      position_buffer[3 * j + 0] = attrs.x;
-      position_buffer[3 * j + 1] = attrs.y;
-      position_buffer[3 * j + 2] = attrs.z;
-
-      texdata_f[16 * j + 0] = attrs.x;
-      texdata_f[16 * j + 1] = attrs.y;
-      texdata_f[16 * j + 2] = attrs.z;
-
-      // quaternions
-      texdata[16 * j + 3] = packHalf2x16(attrs.rot_0, attrs.rot_1);
-      texdata[16 * j + 4] = packHalf2x16(attrs.rot_2, attrs.rot_3);
-
-      // scale
-      texdata[16 * j + 5] = packHalf2x16(Math.exp(attrs.scale_0), Math.exp(attrs.scale_1));
-      texdata[16 * j + 6] = packHalf2x16(Math.exp(attrs.scale_2), 0);
-
-      // rgb
-      texdata_c[4 * (16 * j + 7) + 0] = Math.max(0, Math.min(255, attrs.f_dc_0 * 255));
-      texdata_c[4 * (16 * j + 7) + 1] = Math.max(0, Math.min(255, attrs.f_dc_1 * 255));
-      texdata_c[4 * (16 * j + 7) + 2] = Math.max(0, Math.min(255, attrs.f_dc_2 * 255));
-
-      // opacity
-      texdata_c[4 * (16 * j + 7) + 3] = (1 / (1 + Math.exp(-attrs.opacity))) * 255;
-
-      // movement over time
-      texdata[16 * j + 8 + 0] = packHalf2x16(attrs.motion_0, attrs.motion_1);
-      texdata[16 * j + 8 + 1] = packHalf2x16(attrs.motion_2, attrs.motion_3);
-      texdata[16 * j + 8 + 2] = packHalf2x16(attrs.motion_4, attrs.motion_5);
-      texdata[16 * j + 8 + 3] = packHalf2x16(attrs.motion_6, attrs.motion_7);
-      texdata[16 * j + 8 + 4] = packHalf2x16(attrs.motion_8, 0);
-
-      // rotation over time
-      texdata[16 * j + 8 + 5] = packHalf2x16(attrs.omega_0, attrs.omega_1);
-      texdata[16 * j + 8 + 6] = packHalf2x16(attrs.omega_2, attrs.omega_3);
-
-      // trbf temporal radial basis function parameters
-      texdata[16 * j + 8 + 7] = packHalf2x16(attrs.trbf_center, Math.exp(attrs.trbf_scale));
-    }
-    console.timeEnd("build buffer");
-
-    console.log("Scene Bytes", texdata.buffer.byteLength);
-
-    self.postMessage({ texdata, texwidth, texheight }, [texdata.buffer]);
-  }
-
   self.onmessage = (e) => {
     if (e.data.texture) {
       let texture = e.data.texture;
@@ -263,120 +109,13 @@ function createWorker(self) {
       throttledSort();
     } else if (e.data.ply) {
       vertexCount = 0;
-      vertexCount = processPlyBuffer(e.data.ply);
+      // PLYファイルの処理をconverter.jsから呼び出し
+      const result = processPlyBuffer(e.data.ply);
+      self.postMessage({ texdata: result.texdata, texwidth: result.texwidth, texheight: result.texheight }, [result.texdata.buffer]);
     }
   };
 }
 
-const vertexShaderSource = `
-  #version 300 es
-  precision highp float;
-  precision highp int;
-  
-  uniform highp usampler2D u_texture;
-  uniform mat4 projection, view;
-  uniform vec2 focal;
-  uniform vec2 viewport;
-  uniform float time;
-  
-  in vec2 position;
-  in int index;
-  
-  out vec4 vColor;
-  out vec2 vPosition;
-  
-  void main () {
-      gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-
-      uvec4 motion1 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2) | 3u, uint(index) >> 10), 0);
-      vec2 trbf = unpackHalf2x16(motion1.w);
-      float dt = time - trbf.x;
-
-      float topacity = exp(-1.0 * pow(dt / trbf.y, 2.0));
-      if(topacity < 0.02) return;
-
-      uvec4 motion0 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2) | 2u, uint(index) >> 10), 0);
-      uvec4 static0 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2), uint(index) >> 10), 0);
-
-      vec2 m0 = unpackHalf2x16(motion0.x), m1 = unpackHalf2x16(motion0.y), m2 = unpackHalf2x16(motion0.z), 
-           m3 = unpackHalf2x16(motion0.w), m4 = unpackHalf2x16(motion1.x); 
-      
-      vec4 trot = vec4(unpackHalf2x16(motion1.y).xy, unpackHalf2x16(motion1.z).xy) * dt;
-      vec3 tpos = (vec3(m0.xy, m1.x) * dt + vec3(m1.y, m2.xy) * dt*dt + vec3(m3.xy, m4.x) * dt*dt*dt);
-      
-      vec4 cam = view * vec4(uintBitsToFloat(static0.xyz) + tpos, 1);
-      vec4 pos = projection * cam;
-  
-      float clip = 1.2 * pos.w;
-      if (pos.z < -clip || pos.x < -clip || pos.x > clip || pos.y < -clip || pos.y > clip) return;
-      uvec4 static1 = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 2) | 1u, uint(index) >> 10), 0);
-
-      vec4 rot = vec4(unpackHalf2x16(static0.w).xy, unpackHalf2x16(static1.x).xy) + trot;
-      vec3 scale = vec3(unpackHalf2x16(static1.y).xy, unpackHalf2x16(static1.z).x);
-      rot /= sqrt(dot(rot, rot));
-  
-      mat3 S = mat3(scale.x, 0.0, 0.0, 0.0, scale.y, 0.0, 0.0, 0.0, scale.z);
-      mat3 R = mat3(
-        1.0 - 2.0 * (rot.z * rot.z + rot.w * rot.w), 2.0 * (rot.y * rot.z - rot.x * rot.w), 2.0 * (rot.y * rot.w + rot.x * rot.z),
-        2.0 * (rot.y * rot.z + rot.x * rot.w), 1.0 - 2.0 * (rot.y * rot.y + rot.w * rot.w), 2.0 * (rot.z * rot.w - rot.x * rot.y),
-        2.0 * (rot.y * rot.w - rot.x * rot.z), 2.0 * (rot.z * rot.w + rot.x * rot.y), 1.0 - 2.0 * (rot.y * rot.y + rot.z * rot.z));
-      mat3 M = S * R;
-      mat3 Vrk = 4.0 * transpose(M) * M;
-      mat3 J = mat3(
-          focal.x / cam.z, 0., -(focal.x * cam.x) / (cam.z * cam.z), 
-          0., -focal.y / cam.z, (focal.y * cam.y) / (cam.z * cam.z), 
-          0., 0., 0.
-      );
-  
-      mat3 T = transpose(mat3(view)) * J;
-      mat3 cov2d = transpose(T) * Vrk * T;
-  
-      float mid = (cov2d[0][0] + cov2d[1][1]) / 2.0;
-      float radius = length(vec2((cov2d[0][0] - cov2d[1][1]) / 2.0, cov2d[0][1]));
-      float lambda1 = mid + radius, lambda2 = mid - radius;
-  
-      if(lambda2 < 0.0) return;
-      vec2 diagonalVector = normalize(vec2(cov2d[0][1], lambda1 - cov2d[0][0]));
-      vec2 majorAxis = min(sqrt(2.0 * lambda1), 1024.0) * diagonalVector;
-      vec2 minorAxis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diagonalVector.y, -diagonalVector.x);
-      
-      uint rgba = static1.w;
-      vColor = 
-        clamp(pos.z/pos.w+1.0, 0.0, 1.0) * 
-        vec4(1.0, 1.0, 1.0, topacity) *
-        vec4(
-          (rgba) & 0xffu, 
-          (rgba >> 8) & 0xffu, 
-          (rgba >> 16) & 0xffu, 
-          (rgba >> 24) & 0xffu) / 255.0;
-
-      vec2 vCenter = vec2(pos) / pos.w;
-      gl_Position = vec4(
-          vCenter 
-          + position.x * majorAxis / viewport 
-          + position.y * minorAxis / viewport, 0.0, 1.0);
-
-      vPosition = position;
-  }
-  `.trim();
-
-const fragmentShaderSource = `
-  #version 300 es
-  precision highp float;
-  
-  in vec4 vColor;
-  in vec2 vPosition;
-  
-  out vec4 fragColor;
-  
-  void main () {
-      float A = -dot(vPosition, vPosition);
-      if (A < -4.0) discard;
-      float B = exp(A) * vColor.a;
-      fragColor = vec4(B * vColor.rgb, B);
-  }
-  
-  `.trim();
 
 let defaultViewMatrix = [0.99, 0.01, -0.14, 0, 0.02, 0.99, 0.12, 0, 0.14, -0.12, 0.98, 0, -0.09, -0.26, 0.2, 1];
 
@@ -527,11 +266,36 @@ async function main() {
     // if (document.activeElement != document.body) return;
     carousel = false;
     if (!activeKeys.includes(e.code)) activeKeys.push(e.code);
+
+    // スペースキーが押されたとき、再生/一時停止を切り替える
+    if (e.code === "ShiftLeft") {
+      isPlaying = !isPlaying;
+      
+      if (isPlaying) {
+        // 再生再開時、アニメーション時間を調整
+        if (animationPauseTime > 0) {
+          animationStartTime += (Date.now() - animationPauseTime);
+          animationPauseTime = 0;
+        }
+        // アニメーションが終了していた場合、リセット
+        if (isAnimationEnded) {
+          animationStartTime = Date.now();
+          isAnimationEnded = false;
+        }
+      } else {
+        // 一時停止時、停止時間を記録
+        animationPauseTime = Date.now();
+      }
+      e.preventDefault();
+      return;
+    }
+    
     if (/\d/.test(e.key)) {
       currentCameraIndex = parseInt(e.key);
       camera = cameras[currentCameraIndex];
       viewMatrix = getViewMatrix(camera);
     }
+    
     if (["-", "_"].includes(e.key)) {
       currentCameraIndex = (currentCameraIndex + cameras.length - 1) % cameras.length;
       viewMatrix = getViewMatrix(cameras[currentCameraIndex]);
@@ -743,6 +507,28 @@ async function main() {
   let leftGamepadTrigger, rightGamepadTrigger;
 
   const frame = (now) => {
+    // アニメーションの経過時間を計算
+    let currentTime = Date.now();
+    if (animationStartTime === 0) {
+      animationStartTime = currentTime;
+    }
+
+    let elapsedTime = 0;
+    if (isPlaying && !isAnimationEnded) {
+      if (animationPauseTime > 0) {
+        // 一時停止中は経過時間を更新しない
+        elapsedTime = animationPauseTime - animationStartTime;
+      } else {
+        elapsedTime = currentTime - animationStartTime;
+      }
+      
+      // アニメーションが終了時間に達した場合
+      if (elapsedTime >= animationTotalDuration) {
+        isAnimationEnded = true;
+        isPlaying = false;
+      }
+    }
+
     let inv = invert4(viewMatrix);
     let shiftKey = activeKeys.includes("Shift") || activeKeys.includes("ShiftLeft") || activeKeys.includes("ShiftRight");
 
@@ -858,10 +644,12 @@ async function main() {
 
     viewMatrix = invert4(inv);
 
-    if (carousel) {
+    if (carousel && isPlaying && !isAnimationEnded) {
       let inv = invert4(defaultViewMatrix);
 
-      const t = Math.sin((Date.now() - start) / 5000);
+      // carouselモードの場合、elapsedTimeを使用して位置を計算
+      const normalizedTime = (elapsedTime % animationTotalDuration) / 5000;
+      const t = Math.sin(normalizedTime);
       inv = translate4(inv, 2.5 * t, 0, 6 * (1 - Math.cos(t)));
       inv = rotate4(inv, -0.6 * t, 0, 1, 0);
 
@@ -888,7 +676,11 @@ async function main() {
     if (vertexCount > 0) {
       document.getElementById("spinner").style.display = "none";
       gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
-      gl.uniform1f(u_time, Math.sin(Date.now() / 1000) / 2 + 1 / 2);
+      
+      // 一時停止中や終了時は、time値を更新しない
+      if (isPlaying && !isAnimationEnded) {
+        gl.uniform1f(u_time, Math.sin(Date.now() / 1000) / 2 + 1 / 2);
+      }
 
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
@@ -1002,7 +794,7 @@ async function main() {
     }
   };
 
-  const url = params.get("url") ? new URL(params.get("url"), "https://huggingface.co/cakewalk/splat-data/resolve/main/") : "model.splatv";
+  const url = params.get("url") ? new URL(params.get("url"), "https://huggingface.co/cakewalk/splat-data/resolve/main/") : "sear_stake.splatv";
   const req = await fetch(url, { mode: "cors", credentials: "omit" });
   if (req.status != 200) throw new Error(req.status + " Unable to load " + req.url);
 
@@ -1013,51 +805,6 @@ main().catch((err) => {
   document.getElementById("spinner").style.display = "none";
   document.getElementById("message").innerText = err.toString();
 });
-
-function attachShaders(gl, vertexShaderSource, fragmentShaderSource) {
-  const vertexShader = gl.createShader(gl.VERTEX_SHADER);
-  gl.shaderSource(vertexShader, vertexShaderSource);
-  gl.compileShader(vertexShader);
-  if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(vertexShader));
-
-  const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
-  gl.shaderSource(fragmentShader, fragmentShaderSource);
-  gl.compileShader(fragmentShader);
-  if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(fragmentShader));
-
-  const program = gl.createProgram();
-  gl.attachShader(program, vertexShader);
-  gl.attachShader(program, fragmentShader);
-  gl.linkProgram(program);
-  gl.useProgram(program);
-
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(program));
-  return program;
-}
-
-async function readChunks(reader, chunks, handleChunk) {
-  let chunk = chunks.shift();
-  let buffer = new Uint8Array(chunk.size);
-  let offset = 0;
-  while (chunk) {
-    let { done, value } = await reader.read();
-    if (done) break;
-    while (value.length + offset >= chunk.size) {
-      buffer.set(value.subarray(0, chunk.size - offset), offset);
-      value = value.subarray(chunk.size - offset);
-      handleChunk(chunk, buffer.buffer, 0, chunks);
-      chunk = chunks.shift();
-      if (!chunk) break;
-      buffer = new Uint8Array(chunk.size);
-      offset = 0;
-    }
-    if (!chunk) break;
-    buffer.set(value, offset);
-    offset += value.length;
-    handleChunk(chunk, buffer.buffer, buffer.byteLength - offset, chunks);
-  }
-  if (chunk) handleChunk(chunk, buffer.buffer, 0, chunks);
-}
 
 function getProjectionMatrix(fx, fy, width, height) {
   const znear = 0.2;
