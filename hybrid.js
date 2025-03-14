@@ -27,6 +27,11 @@ let animationStartTime = 0; // アニメーション開始時間
 let animationPauseTime = 0; // 一時停止した時間
 let animationTotalDuration = 10000; // アニメーションの総再生時間（ミリ秒）、必要に応じて調整してください
 
+// 連続再生用のプレイリスト管理
+let playlistIndex = 0;
+let playlist = ["model.splatv", "sear_stake.splatv"];
+let isLoadingNextFile = false;
+
 function createWorker(self) {
   let vertexCount = 0;
   let viewProj;
@@ -524,8 +529,20 @@ async function main() {
       
       // アニメーションが終了時間に達した場合
       if (elapsedTime >= animationTotalDuration) {
-        isAnimationEnded = true;
-        isPlaying = false;
+        // アニメーション終了時に次のファイルを読み込む
+        if (!isLoadingNextFile && playlistIndex < playlist.length - 1) {
+          isLoadingNextFile = true;
+          playlistIndex++;
+          loadFile(playlist[playlistIndex]).then(() => {
+            // 新しいファイルが読み込まれたら再生状態をリセット
+            animationStartTime = Date.now();
+            isAnimationEnded = false;
+            isLoadingNextFile = false;
+          });
+        } else {
+          isAnimationEnded = true;
+          isPlaying = false;
+        }
       }
     }
 
@@ -702,6 +719,7 @@ async function main() {
 
   frame();
 
+  // ファイル選択処理を関数化
   const selectFile = (file) => {
     const fr = new FileReader();
     if (/\.json$/i.test(file.name)) {
@@ -735,6 +753,37 @@ async function main() {
         }
       };
       fr.readAsArrayBuffer(file);
+    }
+  };
+
+  // URLからファイルを読み込む関数
+  const loadFile = async (url) => {
+    document.getElementById("spinner").style.display = "";
+    document.getElementById("progress").style.display = "";
+    document.getElementById("progress").style.width = "0%";
+    
+    try {
+      const fileUrl = new URL(url, "http://localhost:8000/");
+      const req = await fetch(fileUrl, { mode: "cors", credentials: "omit" });
+      
+      if (req.status != 200) {
+        throw new Error(req.status + " Unable to load " + req.url);
+      }
+      
+      console.log(`ファイル読み込み: ${url}`);
+      await readChunks(req.body.getReader(), [{ size: 8, type: "magic" }], chunkHandler);
+      
+      // ファイルが読み込まれたら、アニメーション状態をリセット
+      vertexCount = 0;
+      animationStartTime = Date.now();
+      isAnimationEnded = false;
+      isPlaying = true;
+      return true;
+    } catch (err) {
+      console.error(`ファイル読み込みエラー: ${url}`, err);
+      document.getElementById("message").innerText = err.toString();
+      document.getElementById("spinner").style.display = "none";
+      return false;
     }
   };
 
@@ -794,11 +843,8 @@ async function main() {
     }
   };
 
-  const url = params.get("url") ? new URL(params.get("url"), "https://huggingface.co/cakewalk/splat-data/resolve/main/") : "sear_stake.splatv";
-  const req = await fetch(url, { mode: "cors", credentials: "omit" });
-  if (req.status != 200) throw new Error(req.status + " Unable to load " + req.url);
-
-  await readChunks(req.body.getReader(), [{ size: 8, type: "magic" }], chunkHandler);
+  // 最初のファイルを読み込み開始
+  await loadFile(playlist[playlistIndex]);
 }
 
 main().catch((err) => {
